@@ -1,0 +1,660 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'TEL351 ESP: Assisted Reading. Deploy in us-east-1. Complete the functions, permissions, and triggers described in the lab.'
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name:
+          Fn::Sub: ${AWS::StackName}-site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name:
+          Fn::Sub: ${AWS::StackName}-headers
+        SecurityHeadersConfig:
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            Override: true
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self' https://*.execute-api.us-east-1.amazonaws.com https://s3.us-east-1.amazonaws.com https://*.s3.us-east-1.amazonaws.com; media-src https://s3.us-east-1.amazonaws.com https://*.s3.us-east-1.amazonaws.com; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+            Override: true
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: TEL351 ESP - Assisted Reading
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: Website
+            DomainName:
+              Fn::GetAtt:
+                - WebsiteBucket
+                - RegionalDomainName
+            OriginAccessControlId:
+              Ref: OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: Website
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          ResponseHeadersPolicyId:
+            Ref: ResponseHeadersPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource:
+              - Fn::Sub: ${WebsiteBucket.Arn}/index.html
+              - Fn::Sub: ${WebsiteBucket.Arn}/app.js
+              - Fn::Sub: ${WebsiteBucket.Arn}/styles.css
+              - Fn::Sub: ${WebsiteBucket.Arn}/config.js
+            Condition:
+              StringEquals:
+                AWS:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution}
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - WebsiteBucket
+                  - Arn
+              - Fn::Sub: ${WebsiteBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - Fn::Sub: https://${WebsiteDistribution.DomainName}
+            AllowedMethods:
+              - POST
+              - GET
+              - HEAD
+            AllowedHeaders:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 300
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - DataBucket
+                  - Arn
+              - Fn::Sub: ${DataBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  BootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tel351-esp-bootstrap-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BaseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  Fn::Sub: ${WebsiteBucket.Arn}/*
+  BootstrapFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tel351-esp-bootstrap
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 120
+      Role:
+        Fn::GetAtt:
+          - BootstrapRole
+          - Arn
+      Code:
+        ZipFile: |
+          """Self-contained custom resource that publishes files embedded in the template."""
+          import base64
+          import io
+          import json
+          import logging
+          import urllib.request
+          import zipfile
+          import zlib
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client("s3")
+
+
+          def lambda_handler(event, context):
+              physical_id = event.get("PhysicalResourceId", event["LogicalResourceId"])
+              status, reason, data = "SUCCESS", "Files published", {}
+              try:
+                  if event["RequestType"] != "Delete":
+                      props = event["ResourceProperties"]
+                      files = json.loads(zlib.decompress(base64.b64decode(props["Payload"])))
+                      for key, item in files.items():
+                          content = item["body"]
+                          if props["Kind"] == "code":
+                              stream = io.BytesIO()
+                              with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+                                  info = zipfile.ZipInfo("lambda_function.py", date_time=(2026, 1, 1, 0, 0, 0))
+                                  info.compress_type = zipfile.ZIP_DEFLATED
+                                  archive.writestr(info, content)
+                              body = stream.getvalue()
+                              data[item["output"]] = key
+                          else:
+                              body = content.encode("utf-8")
+                          s3.put_object(Bucket=props["Bucket"], Key=key, Body=body, ContentType=item["contentType"], CacheControl="no-cache")
+                      if props["Kind"] == "website":
+                          config = "window.ESP_CONFIG=" + json.dumps({"apiUrl": props["ApiUrl"]}) + ";"
+                          s3.put_object(Bucket=props["Bucket"], Key="config.js", Body=config.encode("utf-8"), ContentType="text/javascript", CacheControl="no-store")
+                  # Buckets must be emptied manually before deleting the stack.
+              except Exception as error:
+                  logger.exception("Could not publish the files")
+                  status, reason = "FAILED", f"{type(error).__name__}: check CloudWatch Logs"
+              reply = json.dumps({"Status": status, "Reason": reason, "PhysicalResourceId": physical_id, "StackId": event["StackId"], "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"], "NoEcho": False, "Data": data}).encode("utf-8")
+              request = urllib.request.Request(event["ResponseURL"], data=reply, method="PUT", headers={"content-type": "", "content-length": str(len(reply))})
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  response.read()
+    DependsOn:
+      - BootstrapLogs
+  CodeAssets:
+    Type: Custom::ESPFiles
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+          - BootstrapFunction
+          - Arn
+      ServiceTimeout: 180
+      Kind: code
+      Bucket:
+        Ref: WebsiteBucket
+      Payload: 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
+  ExtractRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tel351-esp-extract-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  ExtractFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tel351-esp-extract
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Role:
+        Fn::GetAtt:
+          - ExtractRole
+          - Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:
+            Ref: DataBucket
+      Code:
+        S3Bucket:
+          Ref: WebsiteBucket
+        S3Key:
+          Fn::GetAtt:
+            - CodeAssets
+            - ExtractKey
+    DependsOn:
+      - ExtractLogs
+  TranslateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tel351-esp-translate-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  TranslateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tel351-esp-translate
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Role:
+        Fn::GetAtt:
+          - TranslateRole
+          - Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:
+            Ref: DataBucket
+      Code:
+        S3Bucket:
+          Ref: WebsiteBucket
+        S3Key:
+          Fn::GetAtt:
+            - CodeAssets
+            - TranslateKey
+    DependsOn:
+      - TranslateLogs
+  SynthesizeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tel351-esp-synthesize-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  SynthesizeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tel351-esp-synthesize
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Role:
+        Fn::GetAtt:
+          - SynthesizeRole
+          - Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:
+            Ref: DataBucket
+          VOICE_ID: Lupe
+      Code:
+        S3Bucket:
+          Ref: WebsiteBucket
+        S3Key:
+          Fn::GetAtt:
+            - CodeAssets
+            - SynthesizeKey
+    DependsOn:
+      - SynthesizeLogs
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tel351-esp-api-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BaseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  Fn::Sub: ${DataBucket.Arn}/uploads/*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - Fn::Sub: ${DataBucket.Arn}/uploads/*
+                  - Fn::Sub: ${DataBucket.Arn}/extracted/*
+                  - Fn::Sub: ${DataBucket.Arn}/translated/*
+                  - Fn::Sub: ${DataBucket.Arn}/audio/*
+                  - Fn::Sub: ${DataBucket.Arn}/errors/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::GetAtt:
+                    - DataBucket
+                    - Arn
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tel351-esp-api
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 15
+      Role:
+        Fn::GetAtt:
+          - ApiRole
+          - Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:
+            Ref: DataBucket
+      Code:
+        ZipFile: |
+          """API auxiliar: carga privada de imágenes y lectura de resultados de una solicitud."""
+          import json
+          import logging
+          import os
+          import re
+          import uuid
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          BUCKET = os.environ["DATA_BUCKET"]
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+          MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+          MAX_DOCUMENT_BYTES = 32 * 1024
+          REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
+          s3 = boto3.client("s3", region_name=REGION, endpoint_url=f"https://s3.{REGION}.amazonaws.com", config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}))
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+
+          def response(status, value):
+              return {"statusCode": status, "headers": {"content-type": "application/json; charset=utf-8", "cache-control": "no-store"}, "body": json.dumps(value, ensure_ascii=False)}
+
+
+          def missing(error):
+              return error.response["Error"]["Code"] in {"NoSuchKey", "404", "NotFound"}
+
+
+          def document(key):
+              try:
+                  result = s3.get_object(Bucket=BUCKET, Key=key)
+              except ClientError as error:
+                  if missing(error):
+                      return None
+                  raise
+              body = result["Body"]
+              try:
+                  if result["ContentLength"] > MAX_DOCUMENT_BYTES:
+                      raise ValueError("Documento excede el límite de lectura")
+                  value = json.loads(body.read(MAX_DOCUMENT_BYTES + 1))
+                  if not isinstance(value, dict):
+                      raise ValueError("El resultado no es un objeto JSON")
+                  return value
+              finally:
+                  body.close()
+
+
+          def exists(key):
+              try:
+                  return s3.head_object(Bucket=BUCKET, Key=key)
+              except ClientError as error:
+                  if missing(error):
+                      return None
+                  raise
+
+
+          def current_result(request_id):
+              result = {"requestId": request_id, "status": "pending", "stage": "upload"}
+              if exists(f"uploads/{request_id}.jpg") is None:
+                  return result
+              result["stage"] = "extract"
+              extracted = document(f"extracted/{request_id}.json")
+              if extracted is not None:
+                  if extracted.get("requestId") != request_id or not isinstance(extracted.get("sourceText"), str):
+                      raise ValueError("Contrato de extracción incorrecto")
+                  result.update(sourceText=extracted["sourceText"], stage="translate")
+              translated = document(f"translated/{request_id}.json")
+              if translated is not None:
+                  fields = ("sourceText", "sourceLanguage", "targetLanguage", "translatedText")
+                  if translated.get("requestId") != request_id or any(not isinstance(translated.get(field), str) for field in fields):
+                      raise ValueError("Contrato de traducción incorrecto")
+                  result.update({field: translated[field] for field in fields})
+                  result["stage"] = "synthesize"
+              failure = document(f"errors/{request_id}.json")
+              if failure is not None:
+                  if failure.get("requestId") != request_id:
+                      raise ValueError("Error asociado a otra solicitud")
+                  result.update(status="error", stage=failure.get("stage", result["stage"]), error={key: str(failure.get(key, ""))[:500] for key in ("stage", "code", "message")})
+                  return result
+              audio = exists(f"audio/{request_id}.mp3")
+              if audio is not None and extracted is not None and translated is not None:
+                  if audio["ContentLength"] == 0 or audio.get("ContentType", "").split(";")[0] != "audio/mpeg":
+                      raise ValueError("Audio vacío o con Content-Type incorrecto")
+                  result.update(status="complete", stage="complete", audioUrl=s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": f"audio/{request_id}.mp3"}, ExpiresIn=300))
+              return result
+
+
+          def lambda_handler(event, context):
+              route = event.get("routeKey", "")
+              try:
+                  if route == "POST /requests":
+                      request_id = uuid.uuid4().hex
+                      upload = s3.generate_presigned_post(Bucket=BUCKET, Key=f"uploads/{request_id}.jpg", Fields={"Content-Type": "image/jpeg"}, Conditions=[{"Content-Type": "image/jpeg"}, ["content-length-range", 1, MAX_UPLOAD_BYTES]], ExpiresIn=300)
+                      logger.info("Solicitud creada: %s", request_id)
+                      return response(201, {"requestId": request_id, "upload": upload, "maxUploadBytes": MAX_UPLOAD_BYTES, "expiresIn": 300})
+                  if route == "GET /requests/{requestId}":
+                      request_id = (event.get("pathParameters") or {}).get("requestId", "")
+                      if not REQUEST_ID.fullmatch(request_id):
+                          return response(400, {"message": "El identificador de solicitud no es válido."})
+                      return response(200, current_result(request_id))
+                  return response(404, {"message": "Ruta no encontrada."})
+              except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                  logger.exception("Contrato de resultado inválido")
+                  return response(502, {"message": "Un resultado no cumple el contrato esperado. Revise los objetos S3 y los logs de las funciones."})
+              except Exception:
+                  logger.exception("Error de API auxiliar")
+                  return response(500, {"message": "No fue posible consultar la solicitud. Revise CloudWatch Logs."})
+    DependsOn:
+      - ApiLogs
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: tel351-esp
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - Fn::Sub: https://${WebsiteDistribution.DomainName}
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - content-type
+        MaxAge: 300
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::GetAtt:
+          - ApiFunction
+          - Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 15000
+  CreateRequestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      RouteKey: POST /requests
+      Target:
+        Fn::Sub: integrations/${ApiIntegration}
+      AuthorizationType: NONE
+  GetRequestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      RouteKey: GET /requests/{requestId}
+      Target:
+        Fn::Sub: integrations/${ApiIntegration}
+      AuthorizationType: NONE
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/requests*
+  WebsiteFiles:
+    Type: Custom::ESPFiles
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+          - BootstrapFunction
+          - Arn
+      ServiceTimeout: 180
+      Kind: website
+      Bucket:
+        Ref: WebsiteBucket
+      ApiUrl:
+        Fn::GetAtt:
+          - HttpApi
+          - ApiEndpoint
+      Payload: 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
+  BootstrapLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/tel351-esp-bootstrap
+      RetentionInDays: 7
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/tel351-esp-api
+      RetentionInDays: 7
+  ExtractLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/tel351-esp-extract
+      RetentionInDays: 7
+  TranslateLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/tel351-esp-translate
+      RetentionInDays: 7
+  SynthesizeLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/tel351-esp-synthesize
+      RetentionInDays: 7
+Outputs:
+  WebsiteUrl:
+    Value:
+      Fn::Sub: https://${WebsiteDistribution.DomainName}
+    Description: Assisted Reading website
+  ApiUrl:
+    Value:
+      Fn::GetAtt:
+        - HttpApi
+        - ApiEndpoint
+    Description: Application API
+  DataBucketName:
+    Value:
+      Ref: DataBucket
+    Description: Images and processing results
+  WebsiteBucketName:
+    Value:
+      Ref: WebsiteBucket
+    Description: Website files and starter code
